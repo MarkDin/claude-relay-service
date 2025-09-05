@@ -618,6 +618,12 @@ router.get('/v1/models', authenticateApiKey, async (req, res) => {
         object: 'model',
         created: 1669599635,
         owned_by: 'anthropic'
+      },
+      {
+        id: 'claude-opus-4-1-20250805',
+        object: 'model',
+        created: 1669599635,
+        owned_by: 'anthropic'
       }
     ]
 
