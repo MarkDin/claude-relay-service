@@ -60,7 +60,9 @@ class ClaudeAccountService {
       schedulable = true, // 是否可被调度
       subscriptionInfo = null, // 手动设置的订阅信息
       autoStopOnWarning = false, // 5小时使用量接近限制时自动停止调度
-      useUnifiedUserAgent = false // 是否使用统一Claude Code版本的User-Agent
+      useUnifiedUserAgent = false, // 是否使用统一Claude Code版本的User-Agent
+      useUnifiedClientId = false, // 是否使用统一的客户端标识
+      unifiedClientId = '' // 统一的客户端标识
     } = options
 
     const accountId = uuidv4()
@@ -93,6 +95,8 @@ class ClaudeAccountService {
         schedulable: schedulable.toString(), // 是否可被调度
         autoStopOnWarning: autoStopOnWarning.toString(), // 5小时使用量接近限制时自动停止调度
         useUnifiedUserAgent: useUnifiedUserAgent.toString(), // 是否使用统一Claude Code版本的User-Agent
+        useUnifiedClientId: useUnifiedClientId.toString(), // 是否使用统一的客户端标识
+        unifiedClientId: unifiedClientId || '', // 统一的客户端标识
         // 优先使用手动设置的订阅信息，否则使用OAuth数据中的，否则默认为空
         subscriptionInfo: subscriptionInfo
           ? JSON.stringify(subscriptionInfo)
@@ -166,7 +170,10 @@ class ClaudeAccountService {
       createdAt: accountData.createdAt,
       expiresAt: accountData.expiresAt,
       scopes: claudeAiOauth ? claudeAiOauth.scopes : [],
-      autoStopOnWarning
+      autoStopOnWarning,
+      useUnifiedUserAgent,
+      useUnifiedClientId,
+      unifiedClientId
     }
   }
 
@@ -492,6 +499,9 @@ class ClaudeAccountService {
             autoStopOnWarning: account.autoStopOnWarning === 'true', // 默认为false
             // 添加统一User-Agent设置
             useUnifiedUserAgent: account.useUnifiedUserAgent === 'true', // 默认为false
+            // 添加统一客户端标识设置
+            useUnifiedClientId: account.useUnifiedClientId === 'true', // 默认为false
+            unifiedClientId: account.unifiedClientId || '', // 统一的客户端标识
             // 添加停止原因
             stoppedReason: account.stoppedReason || null
           }
@@ -528,7 +538,9 @@ class ClaudeAccountService {
         'schedulable',
         'subscriptionInfo',
         'autoStopOnWarning',
-        'useUnifiedUserAgent'
+        'useUnifiedUserAgent',
+        'useUnifiedClientId',
+        'unifiedClientId'
       ]
       const updatedData = { ...accountData }
 
@@ -1067,6 +1079,8 @@ class ClaudeAccountService {
       const updatedAccountData = { ...accountData }
       updatedAccountData.rateLimitedAt = new Date().toISOString()
       updatedAccountData.rateLimitStatus = 'limited'
+      // 限流时停止调度，与 OpenAI 账号保持一致
+      updatedAccountData.schedulable = false
 
       // 如果提供了准确的限流重置时间戳（来自API响应头）
       if (rateLimitResetTimestamp) {
@@ -1151,9 +1165,33 @@ class ClaudeAccountService {
       delete accountData.rateLimitedAt
       delete accountData.rateLimitStatus
       delete accountData.rateLimitEndAt // 清除限流结束时间
+      // 恢复可调度状态，与 OpenAI 账号保持一致
+      accountData.schedulable = true
       await redis.setClaudeAccount(accountId, accountData)
 
-      logger.success(`✅ Rate limit removed for account: ${accountData.name} (${accountId})`)
+      logger.success(
+        `✅ Rate limit removed for account: ${accountData.name} (${accountId}), schedulable restored`
+      )
+
+      // 发送 Webhook 通知限流已解除
+      try {
+        const webhookNotifier = require('../utils/webhookNotifier')
+        await webhookNotifier.sendAccountAnomalyNotification({
+          accountId,
+          accountName: accountData.name || 'Claude Account',
+          platform: 'claude-oauth',
+          status: 'recovered',
+          errorCode: 'CLAUDE_OAUTH_RATE_LIMIT_CLEARED',
+          reason: 'Rate limit has been cleared and account is now schedulable',
+          timestamp: getISOStringWithTimezone(new Date())
+        })
+        logger.info(
+          `📢 Webhook notification sent for Claude account ${accountData.name} rate limit cleared`
+        )
+      } catch (webhookError) {
+        logger.error('Failed to send rate limit cleared webhook notification:', webhookError)
+      }
+
       return { success: true }
     } catch (error) {
       logger.error(`❌ Failed to remove rate limit for account: ${accountId}`, error)
@@ -1813,6 +1851,20 @@ class ClaudeAccountService {
       // 保存更新后的账户数据
       await redis.setClaudeAccount(accountId, updatedAccountData)
 
+      // 显式从 Redis 中删除这些字段（因为 HSET 不会删除现有字段）
+      const fieldsToDelete = [
+        'errorMessage',
+        'unauthorizedAt',
+        'blockedAt',
+        'rateLimitedAt',
+        'rateLimitStatus',
+        'rateLimitEndAt',
+        'tempErrorAt',
+        'sessionWindowStart',
+        'sessionWindowEnd'
+      ]
+      await redis.client.hdel(`claude:account:${accountId}`, ...fieldsToDelete)
+
       // 清除401错误计数
       const errorKey = `claude_account:${accountId}:401_errors`
       await redis.client.del(errorKey)
@@ -1864,6 +1916,10 @@ class ClaudeAccountService {
             delete account.errorMessage
             delete account.tempErrorAt
             await redis.setClaudeAccount(account.id, account)
+
+            // 显式从 Redis 中删除这些字段（因为 HSET 不会删除现有字段）
+            await redis.client.hdel(`claude:account:${account.id}`, 'errorMessage', 'tempErrorAt')
+
             // 同时清除500错误计数
             await this.clearInternalErrors(account.id)
             cleanedCount++
@@ -1950,6 +2006,52 @@ class ClaudeAccountService {
 
       // 保存更新后的账户数据
       await redis.setClaudeAccount(accountId, updatedAccountData)
+
+      // 设置 5 分钟后自动恢复（一次性定时器）
+      setTimeout(
+        async () => {
+          try {
+            const account = await redis.getClaudeAccount(accountId)
+            if (account && account.status === 'temp_error' && account.tempErrorAt) {
+              // 验证是否确实过了 5 分钟（防止重复定时器）
+              const tempErrorAt = new Date(account.tempErrorAt)
+              const now = new Date()
+              const minutesSince = (now - tempErrorAt) / (1000 * 60)
+
+              if (minutesSince >= 5) {
+                // 恢复账户
+                account.status = 'active'
+                account.schedulable = 'true'
+                delete account.errorMessage
+                delete account.tempErrorAt
+
+                await redis.setClaudeAccount(accountId, account)
+
+                // 显式删除 Redis 字段
+                await redis.client.hdel(
+                  `claude:account:${accountId}`,
+                  'errorMessage',
+                  'tempErrorAt'
+                )
+
+                // 清除 500 错误计数
+                await this.clearInternalErrors(accountId)
+
+                logger.success(
+                  `✅ Auto-recovered temp_error after 5 minutes: ${account.name} (${accountId})`
+                )
+              } else {
+                logger.debug(
+                  `⏰ Temp error timer triggered but only ${minutesSince.toFixed(1)} minutes passed for ${account.name} (${accountId})`
+                )
+              }
+            }
+          } catch (error) {
+            logger.error(`❌ Failed to auto-recover temp_error account ${accountId}:`, error)
+          }
+        },
+        6 * 60 * 1000
+      ) // 6 分钟后执行，确保已过 5 分钟
 
       // 如果有sessionHash，删除粘性会话映射
       if (sessionHash) {
