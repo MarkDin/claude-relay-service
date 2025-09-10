@@ -24,6 +24,11 @@ class WebhookService {
    */
   async sendNotification(type, data) {
     try {
+      // 支持自定义webhook（用于API Key创建通知）
+      if (data.customWebhook) {
+        return await this.sendToCustomWebhook(data.customWebhook, type, data)
+      }
+
       const config = await webhookConfigService.getConfig()
 
       // 检查是否启用webhook
@@ -68,6 +73,34 @@ class WebhookService {
     } catch (error) {
       logger.error('发送webhook通知失败:', error)
       throw error
+    }
+  }
+
+  /**
+   * 发送到自定义webhook地址
+   */
+  async sendToCustomWebhook(webhookUrl, type, data) {
+    try {
+      // 检测URL类型并发送对应格式的消息
+      if (webhookUrl.includes('open.feishu.cn')) {
+        const platform = { type: 'feishu', url: webhookUrl, enabled: true }
+        await this.sendToFeishu(platform, type, data)
+      } else if (webhookUrl.includes('oapi.dingtalk.com')) {
+        const platform = { type: 'dingtalk', url: webhookUrl, enabled: true }
+        await this.sendToDingTalk(platform, type, data)
+      } else if (webhookUrl.includes('qyapi.weixin.qq.com')) {
+        const platform = { type: 'wechat_work', url: webhookUrl, enabled: true }
+        await this.sendToWechatWork(platform, type, data)
+      } else {
+        const platform = { type: 'custom', url: webhookUrl, enabled: true }
+        await this.sendToCustom(platform, type, data)
+      }
+
+      logger.info(`✅ 成功发送${type}通知到自定义webhook`)
+      return { succeeded: 1, failed: 0 }
+    } catch (error) {
+      logger.error(`❌ 发送${type}通知到自定义webhook失败:`, error.message)
+      return { succeeded: 0, failed: 1 }
     }
   }
 
@@ -376,6 +409,7 @@ class WebhookService {
       systemError: '❌ 系统错误',
       securityAlert: '🔒 安全警报',
       rateLimitRecovery: '🎉 限流恢复通知',
+      apiKeyCreated: '🔑 API Key 创建成功',
       test: '🧪 测试通知'
     }
 
@@ -392,6 +426,7 @@ class WebhookService {
       systemError: 'critical',
       securityAlert: 'critical',
       rateLimitRecovery: 'active',
+      apiKeyCreated: 'active',
       test: 'passive'
     }
 
@@ -408,6 +443,7 @@ class WebhookService {
       systemError: 'alert',
       securityAlert: 'alarm',
       rateLimitRecovery: 'success',
+      apiKeyCreated: 'success',
       test: 'default'
     }
 
@@ -465,6 +501,51 @@ class WebhookService {
   formatNotificationDetails(data) {
     const lines = []
 
+    // API Key 创建通知的特殊格式
+    if (data.apiKeyId) {
+      lines.push(`**API Key ID**: ${data.apiKeyId}`)
+      lines.push(`**API Key 名称**: ${data.apiKeyName}`)
+
+      if (data.apiKey) {
+        lines.push(`**API Key**: \`${data.apiKey}\``)
+      } else if (data.keyPrefix) {
+        lines.push(`**API Key 前缀**: ${data.keyPrefix}`)
+      }
+
+      if (data.description) {
+        lines.push(`**描述**: ${data.description}`)
+      }
+
+      if (data.tokenLimit) {
+        lines.push(`**Token 限额**: ${data.tokenLimit.toLocaleString()}`)
+      }
+
+      if (data.dailyCostLimit) {
+        lines.push(`**日成本限额**: $${data.dailyCostLimit}`)
+      }
+
+      if (data.monthlyCostLimit) {
+        lines.push(`**月成本限额**: $${data.monthlyCostLimit}`)
+      }
+
+      if (data.expiresAt) {
+        const expiryDate = new Date(data.expiresAt).toLocaleString('zh-CN', {
+          timeZone: this.timezone
+        })
+        lines.push(`**过期时间**: ${expiryDate}`)
+      }
+
+      if (data.createdAt) {
+        const createdDate = new Date(data.createdAt).toLocaleString('zh-CN', {
+          timeZone: this.timezone
+        })
+        lines.push(`**创建时间**: ${createdDate}`)
+      }
+
+      return lines.join('\n')
+    }
+
+    // 其他通知类型的格式
     if (data.accountName) {
       lines.push(`**账号**: ${data.accountName}`)
     }
@@ -551,6 +632,7 @@ class WebhookService {
       systemError: 'red',
       securityAlert: 'red',
       rateLimitRecovery: 'green',
+      apiKeyCreated: 'green',
       test: 'blue'
     }
 
@@ -567,6 +649,7 @@ class WebhookService {
       systemError: ':x:',
       securityAlert: ':lock:',
       rateLimitRecovery: ':tada:',
+      apiKeyCreated: ':key:',
       test: ':test_tube:'
     }
 
@@ -583,6 +666,7 @@ class WebhookService {
       systemError: 0xf44336, // 红色
       securityAlert: 0xf44336, // 红色
       rateLimitRecovery: 0x4caf50, // 绿色
+      apiKeyCreated: 0x4caf50, // 绿色
       test: 0x2196f3 // 蓝色
     }
 
