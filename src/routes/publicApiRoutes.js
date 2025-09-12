@@ -6,6 +6,27 @@ const webhookService = require('../services/webhookService')
 const logger = require('../utils/logger')
 const { getISOStringWithTimezone } = require('../utils/dateHelper')
 
+// 根路径路由
+router.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Claude Relay Service Public API',
+    version: '1.0.0',
+    endpoints: ['GET /public/test', 'GET /public/api/test', 'POST /public/api/generate-key'],
+    timestamp: new Date().toISOString()
+  })
+})
+
+// API路径根路由
+router.get('/api/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Public API endpoints',
+    endpoints: ['GET /public/api/test', 'POST /public/api/generate-key'],
+    timestamp: new Date().toISOString()
+  })
+})
+
 // Test route to verify routes are working
 router.get('/test', (req, res) => {
   res.json({
@@ -104,7 +125,7 @@ const signatureMiddleware = (req, res, next) => {
  *   "feishuWebhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
  * }
  */
-router.post('/generate-key', ipWhitelistMiddleware, signatureMiddleware, async (req, res) => {
+router.post('/api/generate-key', ipWhitelistMiddleware, signatureMiddleware, async (req, res) => {
   try {
     const {
       name,
@@ -167,14 +188,14 @@ router.post('/generate-key', ipWhitelistMiddleware, signatureMiddleware, async (
 
     const apiKeyResult = await apiKeyService.generateApiKey(apiKeyOptions)
 
-    if (!apiKeyResult.success) {
+    if (!apiKeyResult || !apiKeyResult.apiKey) {
       return res.status(500).json({
         success: false,
-        error: apiKeyResult.error || 'Failed to generate API key'
+        error: 'Failed to generate API key'
       })
     }
 
-    const { apiKey, keyInfo } = apiKeyResult
+    const { apiKey, ...keyInfo } = apiKeyResult
 
     logger.info(`Public API generated new API key: ${keyInfo.id}`)
 
